@@ -15,5 +15,7 @@
     "plugin.storage",
     "assets:directory",
     "storage"
-  ]
+  ],
+  "author": "AnnoDomini",
+  "repo": "sheldon0112/ccgui-plugin-personal-task-board"
 }

@@ -4,7 +4,7 @@
 
 ## 安装
 
-在 CC GUI 中选择“插件 → 从本地目录安装”，选择本仓库的 **ccgui-plugin/** 目录（包含 manifest.json 的那一层）。这是手写单文件 ESM 插件，不需要构建，也不必安装开发依赖。
+在 CC GUI 中选择“插件 → 从本地目录安装”，选择本仓库的 **ccgui-plugin/** 目录（包含 manifest.json 的那一层）。这是手写单文件 ESM 插件，不需要构建，也不必安装开发依赖。市场收录后也可一键安装。
 
 修改后重新安装同一目录即可热重载。更新前请先结束看板任务；插件页可禁用或卸载。
 
@@ -37,3 +37,12 @@ pnpm test
 - docs/：开发、验收及规范核查记录，历史版本记录保留原项目中的路径供追溯。
 
 本插件参考 Multica 的任务流程，未提取其原版界面或业务代码。
+
+
+## 市场发布与许可证
+
+本项目采用 [MIT 许可证](LICENSE)。公开 Release 由 [.github/workflows/release.yml](.github/workflows/release.yml) 从版本标签的源码打包，不手工上传本地产物。
+
+根 manifest.json 与 ccgui-plugin/manifest.json 保持一致；标签必须等于 version 且不加 v 前缀。Release 附件为 main.js、manifest.json、styles.css 和 checksums.txt。组件样式内嵌 main.js，styles.css 只说明这一交付形式。
+
+手动下载 Release 时，将三个插件附件放在同一目录，通过 CC GUI 本地安装入口选择该目录。市场初次上架还需索引仓库维护者人工审核合并。

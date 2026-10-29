@@ -1,0 +1,31 @@
+name: 发布插件
+on:
+  push:
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+'
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: 检查源码与版本
+        run: |
+          node --check ccgui-plugin/main.js
+          node --input-type=module -e 'import fs from "node:fs"; const m=JSON.parse(fs.readFileSync("manifest.json","utf8")); if(m.version !== process.env.GITHUB_REF_NAME || m.tier !== "js") process.exit(1);'
+      - name: 打包并计算 SHA-256
+        run: |
+          cmp manifest.json ccgui-plugin/manifest.json
+          mkdir release
+          cp ccgui-plugin/main.js manifest.json styles.css release/
+          cd release
+          sha256sum main.js manifest.json styles.css > checksums.txt
+      - name: 创建 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" release/main.js release/manifest.json release/styles.css release/checksums.txt --verify-tag --title "$GITHUB_REF_NAME" --notes "个人任务看板首次市场发布；手写 ESM 由 Actions 从标签源码打包，附 SHA-256 校验清单。"
