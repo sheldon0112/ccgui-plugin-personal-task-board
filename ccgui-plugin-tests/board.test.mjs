@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createBoard, createViewStore, selectTasks, routesToAgent, childFromComment, isOverdue, resumeTarget, taskMetrics, taskAttachments, revealTaskView, taskNotices, taskTimeline, taskSwimlanes, stageNotices, selectTaskRange, sourceContext } from "../ccgui-plugin/main.js";
+import { createBoard, createViewStore, selectTasks, routesToAgent, childFromComment, isOverdue, resumeTarget, taskMetrics, taskAttachments, revealTaskView, taskNotices, taskTimeline, taskSwimlanes, stageNotices, selectTaskRange, sourceContext, taskHistory, commentAgentId } from "../ccgui-plugin/main.js";
 
 const input = { title: "修复列表", description: "空列表显示占位", criteria: "空列表不抛异常", priority: "high", workspacePath: "/repo", engine: "codex", model: "model-a" };
 const deferred = () => { let resolve; let reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; };
@@ -914,4 +914,232 @@ test("选区引用拒绝非法来源、空白、超长和未知类型，损坏�
   const doc = JSON.parse(env.file()); doc.tasks[0].comments[0].quote.kind = "unknown";
   const bad = setup({ file: JSON.stringify(doc) }); await bad.board.ready; assert.equal(bad.board.getSnapshot().ready, false); assert.match(bad.board.getSnapshot().error, /引用/); assert.equal(bad.calls.writes, 0);
   env.board.dispose(); bad.board.dispose();
+});
+
+
+test("交付物批量登记原子写入、来源校验、失败回滚、重载和移除不触发执行", async () => {
+  const env = setup(); await env.board.ready; const id = await env.board.save(input);
+  const file = { name: "成果.txt", path: "/repo/result.txt", grantId: "g" };
+  const comment = await env.board.addComment(id, { content: "/note 成果", files: [file] });
+  const commentId = env.board.getSnapshot().tasks[0].comments[0].id;
+  await assert.rejects(env.board.addDeliverables(id, [{ file, commentId: "missing" }]), /来源评论/);
+  await assert.rejects(env.board.addDeliverables(id, [{ file, runId: "missing" }]), /关联运行/);
+  const before = env.file(); env.options.failWrite = true;
+  await assert.rejects(env.board.addDeliverables(id, [{ file, commentId }, { file: { ...file, path: "/other/result.txt" } }]), /磁盘/);
+  assert.equal(env.file(), before); assert.equal(env.board.getSnapshot().tasks[0].deliverables, undefined);
+  env.options.failWrite = false; const writes = env.calls.writes;
+  await env.board.addDeliverables(id, [{ file, commentId }, { file: { ...file, path: "/other/result.txt" } }]);
+  assert.equal(env.calls.writes, writes + 1); await env.board.reload();
+  assert.equal(env.board.getSnapshot().tasks[0].deliverables.length, 2);
+  assert.equal(env.board.getSnapshot().tasks[0].deliverables[0].commentId, commentId);
+  await env.board.removeDeliverable(id, env.board.getSnapshot().tasks[0].deliverables[0].id);
+  assert.equal(env.board.getSnapshot().tasks[0].deliverables.length, 1); assert.equal(env.calls.starts.length, 0);
+});
+
+test("时间线按发生时间和同刻事件顺序组织，不补造旧运行结束时间", () => {
+  const at = "2026-10-29T01:00:00.000Z";
+  const task = { createdAt: at, comments: [{ id: "c", createdAt: at }], feedbacks: [{ id: "f", createdAt: at, afterRunId: "r" }], deliverables: [{ id: "d", createdAt: at, file: { name: "成果" } }], runs: [{ id: "r", startedAt: at, endedAt: at, outcome: "ended", reviewDecision: "accepted", reviewedAt: at }, { id: "old", startedAt: at, outcome: "unknown" }] };
+  const before = JSON.stringify(task); const events = taskHistory(task);
+  assert.equal(events[0].id, "created"); assert.ok(events.findIndex((entry) => entry.id === "start:r") < events.findIndex((entry) => entry.id === "end:r"));
+  assert.equal(events.filter((entry) => entry.id === "end:old").length, 0); assert.equal(events.filter((entry) => entry.label === "验收不通过").length, 1);
+  assert.equal(events.find((entry) => entry.id === "feedback:f").runId, "r"); assert.equal(JSON.stringify(task), before); assert.deepEqual(taskHistory(task), events);
+});
+
+test("项目资源按工作区隔离，每轮清单快照不随资源修改变化，非法资源和失败保存不覆盖", async () => {
+  const env = setup(); await env.board.ready; const id = await env.board.save({ ...input, project: "项目" });
+  const resources = { links: ["https://example.com/spec"], files: [{ name: "接口.md", path: "/repo/api.md", grantId: "g" }] };
+  await env.board.saveProject("/other", "项目", "其他说明", { links: ["https://other.example.com"], files: [] });
+  await env.board.saveProject("/repo", "项目", "当前说明", resources);
+  const before = env.file(); await assert.rejects(env.board.saveProject("/repo", "项目", "", { links: ["javascript:alert(1)"], files: [] }), /HTTP/); assert.equal(env.file(), before);
+  env.options.failWrite = true; await assert.rejects(env.board.saveProject("/repo", "项目", "", { links: [], files: [] }), /磁盘/); assert.equal(env.file(), before); env.options.failWrite = false;
+  await env.board.start(id); assert.match(env.calls.starts[0].prompt, /https:\/\/example.com\/spec/); assert.doesNotMatch(env.calls.starts[0].prompt, /other.example/);
+  const old = structuredClone(env.board.getSnapshot().tasks[0].runs[0].input); assert.deepEqual(old.projectResources, resources);
+  env.emit({ kind: "done" }); await tick(); await env.board.saveProject("/repo", "项目", "新说明", { links: [], files: [] });
+  assert.deepEqual(env.board.getSnapshot().tasks[0].runs[0].input, old); await env.board.reload(); assert.deepEqual(env.board.getSnapshot().tasks[0].runs[0].input, old);
+  await env.board.start(id); assert.doesNotMatch(env.calls.starts[1].prompt, /example.com/);
+});
+
+test("编辑对照读取最新文档后保持就绪，基线冲突被拒绝，只应用编辑字段并保留新评论", async () => {
+  const env = setup(); await env.board.ready; const id = await env.board.save(input); const baseline = env.board.getSnapshot().tasks[0];
+  await env.board.editFields(id, { title: "另一编辑器标题" });
+  await assert.rejects(env.board.save({ ...baseline, title: "本地标题" }, id, baseline), /编辑冲突/);
+  await env.board.addComment(id, { content: "/note 新评论" });
+  const latest = await env.board.refreshForEdit(id); assert.equal(env.board.getSnapshot().ready, true); assert.equal(latest.title, "另一编辑器标题");
+  await env.board.save({ ...baseline, title: "本地标题" }, id, latest);
+  assert.equal(env.board.getSnapshot().tasks[0].title, "本地标题"); assert.equal(env.board.getSnapshot().tasks[0].comments.length, 1);
+  env.conflict(); await assert.rejects(env.board.save({ ...latest, title: "第二次输入" }, id, env.board.getSnapshot().tasks[0]), /版本冲突/);
+  assert.equal(env.board.getSnapshot().tasks[0].title, "本地标题");
+});
+
+test("手动交接隔离模型配置和输入，保存失败不启动，审查需前序结果，结束仍待验收", async () => {
+  const env = setup(); await env.board.ready; const id = await env.board.save(input);
+  const config = { step: "implement", engine: "codex", model: "", providerId: "", instruction: "先实现并验证" };
+  await assert.rejects(env.board.start(id, null, null, { ...config, step: "review" }), /先完成/);
+  env.options.failWrite = true; await assert.rejects(env.board.start(id, null, null, config), /磁盘/); assert.equal(env.calls.starts.length, 0); env.options.failWrite = false;
+  await env.board.start(id, null, null, config); let task = env.board.getSnapshot().tasks[0];
+  assert.equal(task.model, "model-a"); assert.equal(task.runs[0].model, ""); assert.equal(task.runs[0].step, "implement"); assert.deepEqual(task.stepConfigs.implement, config);
+  assert.match(env.calls.starts[0].prompt, /本轮处理步骤：实现/); assert.equal(task.runs[0].input.prompt, env.calls.starts[0].prompt);
+  await assert.rejects(env.board.start(id, null, null, config), /已有看板/);
+  env.emit({ kind: "done" }); await tick(); assert.equal(env.board.getSnapshot().tasks[0].status, "review");
+  const review = { ...config, step: "review", model: "model-a", instruction: "独立核对成果" };
+  await env.board.start(id, null, null, review); task = env.board.getSnapshot().tasks[0];
+  assert.equal(task.runs[1].previousRunId, task.runs[0].id); assert.equal(task.runs[1].step, "review"); assert.equal(env.calls.starts[1].sessionId, undefined);
+  assert.match(env.calls.starts[1].prompt, /独立核对成果/); env.emit({ kind: "done" }); await tick();
+  assert.equal(env.board.getSnapshot().tasks[0].status, "review"); await env.board.reload(); assert.equal(env.board.getSnapshot().tasks[0].stepConfigs.review.instruction, "独立核对成果");
+});
+
+test("损坏的新功能记录拒绝载入并保留原文件", async () => {
+  const seed = setup(); await seed.board.ready; await seed.board.save(input);
+  for (const patch of [{ deliverables: [{}] }, { stepConfigs: { review: { step: "implement" } } }]) {
+    const data = JSON.parse(seed.file()); Object.assign(data.tasks[0], patch); const file = JSON.stringify(data); const env = setup({ file }); await env.board.ready;
+    assert.equal(env.board.getSnapshot().ready, false); assert.equal(env.file(), file); assert.equal(env.calls.writes, 0);
+  }
+});
+
+
+test("审查来源与成果快照保留，审查拒绝后的具体反馈复用返工机制", async () => {
+  const env = setup(); await env.board.ready; const id = await env.board.save(input);
+  await env.board.start(id); env.emit({ kind: "done" }); await tick();
+  await env.board.addDeliverables(id, [{ file: { name: "报告.md", path: "/repo/report.md", grantId: "g" } }]);
+  const previous = env.board.getSnapshot().tasks[0].runs.at(-1).id;
+  await env.board.start(id, null, null, { step: "review", engine: "codex", model: "", providerId: "", instruction: "核对金额列" });
+  let task = env.board.getSnapshot().tasks[0]; const review = task.runs.at(-1);
+  assert.equal(review.previousRunId, previous); assert.equal(review.sourceDeliverables[0].file.path, "/repo/report.md");
+  assert.equal(taskHistory(task).find((entry) => entry.id === `start:${review.id}`).previousRunId, previous);
+  env.emit({ kind: "done" }); await tick(); await env.board.removeDeliverable(id, task.deliverables[0].id);
+  await env.board.addFeedback(id, "金额列缺失，请补齐并验证", review.id); await env.board.start(id);
+  assert.match(env.calls.starts.at(-1).prompt, /金额列缺失，请补齐并验证/);
+  task = env.board.getSnapshot().tasks[0]; assert.equal(task.runs.find((entry) => entry.id === review.id).sourceDeliverables.length, 1); assert.equal(task.runs.find((entry) => entry.id === review.id).reviewDecision, "rejected");
+  env.emit({ kind: "done" }); await tick(); assert.equal(env.board.getSnapshot().tasks[0].status, "review");
+});
+
+
+test("审查历史输入重试保留原前序运行与成果快照，不取当前登记", async () => {
+  const env = setup(); await env.board.ready; const id = await env.board.save(input);
+  await env.board.start(id); env.emit({ kind: "done" }); await tick();
+  await env.board.addDeliverables(id, [{ file: { name: "旧成果.md", path: "/repo/old.md", grantId: "g" } }]);
+  await env.board.start(id, null, null, { step: "review", engine: "codex", model: "", providerId: "", instruction: "审查旧成果" });
+  env.emit({ kind: "error", error: "模拟失败" }); await tick();
+  const review = env.board.getSnapshot().tasks[0].runs.at(-1);
+  await env.board.removeDeliverable(id, review.sourceDeliverables[0].id);
+  await env.board.start(id, null, review.id); const retry = env.board.getSnapshot().tasks[0].runs.at(-1);
+  assert.deepEqual(retry.sourceDeliverables, review.sourceDeliverables); assert.equal(retry.previousRunId, review.previousRunId); assert.equal(retry.step, "review"); assert.equal(retry.input.prompt, review.input.prompt);
+  env.emit({ kind: "done" }); await tick(); await env.board.reload(); assert.deepEqual(env.board.getSnapshot().tasks[0].runs.at(-1).sourceDeliverables, review.sourceDeliverables);
+});
+
+
+test("Agent 指派手动执行、配置隔离与历史快照，归档和工作区门禁", async () => {
+  const env = setup(); await env.board.ready; const id = await env.board.save(input);
+  const config = { name: "实现同事", instruction: "逐条验证", engine: "codex", model: "", providerId: "", workspacePath: "/repo" };
+  const agentId = await env.board.saveAgent(config); await env.board.assignAgent(id, agentId); assert.equal(env.calls.starts.length, 0);
+  await env.board.start(id); let task = env.board.getSnapshot().tasks[0]; assert.equal(task.model, "model-a"); assert.equal(task.runs[0].model, ""); assert.equal(task.runs[0].agentSnapshot.id, agentId); assert.match(env.calls.starts[0].prompt, /实现同事/);
+  env.emit({ kind: "done" }); await tick(); await env.board.saveAgent({ ...config, name: "新名称", instruction: "新说明", archived: true }, agentId);
+  assert.equal(env.board.getSnapshot().tasks[0].runs[0].agentSnapshot.name, "实现同事"); await assert.rejects(env.board.start(id), /归档/);
+  await env.board.saveAgent({ ...config, workspacePath: "/other" }, agentId); await assert.rejects(env.board.start(id), /工作区/);
+  await env.board.reload(); assert.equal(env.board.getSnapshot().agents[0].id, agentId); await env.board.assignAgent(id, null); assert.equal(env.board.getSnapshot().tasks[0].assigneeId, null);
+});
+
+test("Agent 保存失败保持原数据，损坏身份记录拒绝载入", async () => {
+  const env = setup(); await env.board.ready; env.options.failWrite = true;
+  await assert.rejects(env.board.saveAgent({ name: "审查", instruction: "审查", engine: "codex" }), /磁盘/); assert.equal(env.board.getSnapshot().agents.length, 0);
+  const bad = setup({ file: JSON.stringify({ schemaVersion: 1, tasks: [], agents: [{ id: "a", name: "" }] }) }); await bad.board.ready; assert.equal(bad.board.getSnapshot().ready, false); assert.equal(bad.calls.writes, 0);
+});
+
+
+const collaborator = (name) => ({ name, instruction: `${name}负责验证`, engine: "codex", model: "", providerId: "", workspacePath: "/repo" });
+
+test("定向提及按稳定ID路由，不改变负责人；改名后回复仍沿原Agent，归档目标拒绝", async () => {
+  const env = setup(); await env.board.ready; const taskId = await env.board.save(input);
+  const ownerId = await env.board.saveAgent(collaborator("负责人")), targetId = await env.board.saveAgent(collaborator("同名"));
+  await env.board.assignAgent(taskId, ownerId);
+  await env.board.addComment(taskId, { content: "请核对金额", targetAgentId: targetId });
+  let task = env.board.getSnapshot().tasks[0]; assert.equal(task.assigneeId, ownerId); assert.equal(task.runs.at(-1).agentSnapshot.id, targetId); const runId = task.runs.at(-1).id;
+  env.emit({ kind: "done" }); await tick(); await env.board.saveAgent(collaborator("改名同事"), targetId);
+  await env.board.addComment(taskId, { content: "请继续核对", replyTo: `run:${runId}` }); task = env.board.getSnapshot().tasks[0]; assert.equal(task.runs.at(-1).agentSnapshot.id, targetId); assert.match(env.calls.starts.at(-1).prompt, /改名同事/);
+  env.emit({ kind: "done" }); await tick(); const count = env.calls.starts.length;
+  await env.board.addComment(taskId, { content: "/note 不启动", targetAgentId: targetId }); assert.equal(env.calls.starts.length, count);
+  await env.board.saveAgent({ ...collaborator("归档"), archived: true }, targetId); const before = env.file();
+  await assert.rejects(env.board.addComment(taskId, { content: "继续", targetAgentId: targetId }), /归档/); assert.equal(env.file(), before);
+  await assert.rejects(env.board.addComment(taskId, { content: "继续", targetAgentId: "missing" }), /不存在/);
+});
+
+test("共享方法绑定多个Agent，修改和停用只影响后续运行，快照与历史重试独立", async () => {
+  const env = setup(); await env.board.ready; const taskId = await env.board.save(input);
+  const methodId = await env.board.saveMethod({ name: "金额检查", content: "核对金额字段" });
+  const agentId = await env.board.saveAgent({ ...collaborator("检查员"), methodIds: [methodId] });
+  const second = await env.board.saveAgent({ ...collaborator("第二位"), methodIds: [methodId] });
+  await env.board.assignAgent(taskId, agentId); await env.board.start(taskId);
+  const first = structuredClone(env.board.getSnapshot().tasks[0].runs.at(-1)); assert.match(first.input.prompt, /核对金额字段/); assert.equal(first.methodSnapshots[0].id, methodId);
+  env.emit({ kind: "error", error: "模拟错误" }); await tick(); await env.board.saveMethod({ name: "新金额检查", content: "新步骤", archived: true }, methodId);
+  await env.board.start(taskId, null, first.id); assert.equal(env.board.getSnapshot().tasks[0].runs.at(-1).methodSnapshots[0].content, "核对金额字段");
+  env.emit({ kind: "done" }); await tick(); await env.board.assignAgent(taskId, second); await env.board.start(taskId); assert.equal(env.board.getSnapshot().tasks[0].runs.at(-1).methodSnapshots.length, 0);
+  assert.doesNotMatch(env.calls.starts.at(-1).prompt, /核对金额字段/); env.emit({ kind: "done" }); await tick(); await env.board.reload(); assert.equal(env.board.getSnapshot().methods[0].archived, true);
+});
+
+test("小队队长建议与人工派活串行闭环，来源受控且重复确认不二次启动", async () => {
+  const env = setup(); await env.board.ready; const taskId = await env.board.save(input);
+  const leaderId = await env.board.saveAgent(collaborator("队长")), memberId = await env.board.saveAgent(collaborator("成员"));
+  const squadId = await env.board.saveSquad({ name: "交付小队", leaderId, memberIds: [leaderId, memberId], instruction: "先验证再交付" });
+  await env.board.startSquadLeader(taskId, squadId); assert.equal(env.calls.starts.length, 1); assert.match(env.calls.starts[0].prompt, /只提出派活建议/);
+  const leaderRunId = env.board.getSnapshot().tasks[0].runs.at(-1).id;
+  await assert.rejects(env.board.saveProposal(taskId, squadId, leaderRunId, memberId, "实现"), /先完成/);
+  env.emit({ kind: "done" }); await tick(); const count = env.calls.starts.length;
+  await assert.rejects(env.board.saveProposal(taskId, squadId, leaderRunId, "outsider", "实现"), /有效成员/);
+  const proposalId = await env.board.saveProposal(taskId, squadId, leaderRunId, memberId, "补齐金额列并验证"); assert.equal(env.calls.starts.length, count);
+  env.options.failWrite = true; await assert.rejects(env.board.dispatchProposal(taskId, proposalId), /磁盘/); assert.equal(env.board.getSnapshot().tasks[0].proposals[0].status, "pending"); env.options.failWrite = false;
+  await env.board.dispatchProposal(taskId, proposalId); await assert.rejects(env.board.dispatchProposal(taskId, proposalId), /已执行|已有/);
+  const task = env.board.getSnapshot().tasks[0]; assert.equal(task.assigneeId, undefined); assert.equal(task.runs.at(-1).agentSnapshot.id, memberId); assert.equal(task.runs.at(-1).coordination.leaderRunId, leaderRunId); assert.match(env.calls.starts.at(-1).prompt, /补齐金额列并验证/);
+  env.emit({ kind: "done" }); await tick(); assert.equal(env.board.getSnapshot().tasks[0].status, "review"); await env.board.reload(); assert.equal(env.board.getSnapshot().squads[0].id, squadId);
+});
+
+test("宿主日志过滤其他运行、去重、未知状态保留、重载和订阅清理", async () => {
+  const env = setup(); let hooks; let cleaned = false;
+  env.board.dispose(); env.ctx.hooks = { registerTurnHooks: (value) => { hooks = value; return () => { cleaned = true; }; } };
+  const board = createBoard(env.ctx); await board.ready; const taskId = await board.save(input); await board.start(taskId);
+  const event = { eventId: "e1", runId: "r1", turnId: "t1", engine: "codex", workspacePath: "/repo", occurredAt: "2026-10-29T01:00:00Z", kind: "command-finished", command: "echo test", cwd: "/repo", status: "unknown", exitCode: null };
+  hooks.onRuntimeEvent({ ...event, runId: "foreign" }); hooks.onRuntimeEvent({ ...event, workspacePath: "/other" }); hooks.onRuntimeEvent(event); hooks.onRuntimeEvent(event); await tick(); await tick();
+  const run = board.getSnapshot().tasks[0].runs.at(-1); assert.equal(run.runtimeEvents.length, 1); assert.equal(run.runtimeEvents[0].status, "unknown"); assert.equal(run.logCapability, "observing");
+  env.emit({ kind: "done" }); await tick(); await board.reload(); assert.equal(board.getSnapshot().tasks[0].runs.at(-1).runtimeEvents.length, 1); board.dispose(); assert.equal(cleaned, true);
+});
+
+
+test("队长历史重试保留小队来源，未知显式提及不继承历史身份，损坏提案不载入", async () => {
+  const env = setup(); await env.board.ready; const id = await env.board.save(input); const leaderId = await env.board.saveAgent(collaborator("队长"));
+  const squadId = await env.board.saveSquad({ name: "小队", leaderId, memberIds: [leaderId], instruction: "协调" });
+  await env.board.startSquadLeader(id, squadId); const old = env.board.getSnapshot().tasks[0].runs.at(-1); env.emit({ kind: "error", error: "故障" }); await tick();
+  await env.board.start(id, null, old.id); env.emit({ kind: "done" }); await tick(); const task = env.board.getSnapshot().tasks[0]; assert.equal(task.runs.at(-1).coordination.kind, "leader");
+  await env.board.saveProposal(id, squadId, task.runs.at(-1).id, leaderId, "下一步");
+  assert.equal(commentAgentId(task, "@someone 请看", `run:${old.id}`), null);
+  const data = JSON.parse(env.file()); data.tasks[0].proposals = {}; const bad = setup({ file: JSON.stringify(data) }); await bad.board.ready; assert.equal(bad.board.getSnapshot().ready, false); assert.equal(bad.calls.writes, 0);
+});
+
+
+test("日志采集早于启动返回仍关联本插件运行，保存失败可见且未知退出码不伪造", async () => {
+  const env = setup(); env.board.dispose(); let hooks;
+  env.ctx.hooks = { registerTurnHooks: (value) => { hooks = value; return () => {}; } };
+  env.ctx.sessions.startRun = async () => {
+    hooks.onRuntimeEvent({ eventId: "early", runId: "early-run", engine: "codex", workspacePath: "/repo", kind: "command-finished", occurredAt: "2026-10-29T00:00:00Z", command: "false", status: "unknown", exitCode: null });
+    return { runId: "early-run", sessionId: "s" };
+  };
+  const board = createBoard(env.ctx); await board.ready; const id = await board.save(input); await board.start(id); await tick();
+  assert.equal(board.getSnapshot().tasks[0].runs[0].runtimeEvents[0].exitCode, null);
+  env.options.failWrite = true; hooks.onRuntimeEvent({ eventId: "failure", runId: "early-run", engine: "codex", workspacePath: "/repo", kind: "tool-finished", occurredAt: "2026-10-29T00:00:01Z", toolName: "shell", status: "failed" }); await tick(); assert.match(board.getSnapshot().error, /磁盘/); assert.equal(board.getSnapshot().tasks[0].runs[0].runtimeEvents.length, 1); board.dispose();
+});
+
+
+test("Agent 头像分别保存，旧成员默认头像，修改不改历史快照且非法头像不落盘", async () => {
+  const env = setup(); await env.board.ready; const taskId = await env.board.save(input);
+  const first = await env.board.saveAgent({ ...collaborator("狐狸成员"), avatar: "fox" });
+  const second = await env.board.saveAgent(collaborator("旧成员"));
+  assert.equal(env.board.getSnapshot().agents.find((agent) => agent.id === second).avatar, "robot");
+  await env.board.assignAgent(taskId, first); await env.board.start(taskId);
+  assert.equal(env.board.getSnapshot().tasks[0].runs[0].agentSnapshot.avatar, "fox");
+  env.emit({ kind: "done" }); await tick();
+  await env.board.saveAgent({ ...collaborator("狐狸成员"), avatar: "owl" }, first);
+  await env.board.reload();
+  assert.equal(env.board.getSnapshot().agents.find((agent) => agent.id === first).avatar, "owl");
+  assert.equal(env.board.getSnapshot().tasks[0].runs[0].agentSnapshot.avatar, "fox");
+  const before = env.file();
+  for (const avatar of ["https://example.com/avatar.png", "__proto__", ["fox"], 2]) await assert.rejects(env.board.saveAgent({ ...collaborator("非法"), avatar }), /头像/);
+  assert.equal(env.file(), before);
 });
