@@ -28,4 +28,4 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" release/main.js release/manifest.json release/styles.css release/checksums.txt --verify-tag --title "$GITHUB_REF_NAME" --notes "个人任务看板首次市场发布；手写 ESM 由 Actions 从标签源码打包，附 SHA-256 校验清单。"
+          gh release create "$GITHUB_REF_NAME" release/main.js release/manifest.json release/styles.css release/checksums.txt --verify-tag --title "$GITHUB_REF_NAME" --notes "个人任务看板版本发布；手写 ESM 由 Actions 从标签源码打包，附 SHA-256 校验清单。"

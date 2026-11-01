@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createBoard, createViewStore, selectTasks, routesToAgent, childFromComment, isOverdue, resumeTarget, taskMetrics, taskAttachments, revealTaskView, taskNotices, taskTimeline, taskSwimlanes, stageNotices, selectTaskRange, sourceContext, taskHistory, commentAgentId } from "../ccgui-plugin/main.js";
+import { dueDateShortcut, createBoard, createViewStore, selectTasks, routesToAgent, childFromComment, isOverdue, resumeTarget, taskMetrics, taskAttachments, revealTaskView, taskNotices, taskTimeline, taskSwimlanes, stageNotices, selectTaskRange, sourceContext, taskHistory, commentAgentId } from "../ccgui-plugin/main.js";
 
 const input = { title: "修复列表", description: "空列表显示占位", criteria: "空列表不抛异常", priority: "high", workspacePath: "/repo", engine: "codex", model: "model-a" };
 const deferred = () => { let resolve; let reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; };
@@ -1142,4 +1142,98 @@ test("Agent 头像分别保存，旧成员默认头像，修改不改历史快�
   const before = env.file();
   for (const avatar of ["https://example.com/avatar.png", "__proto__", ["fox"], 2]) await assert.rejects(env.board.saveAgent({ ...collaborator("非法"), avatar }), /头像/);
   assert.equal(env.file(), before);
+});
+
+
+test("置顶跨排序生效但不越过筛选，重载及编辑保留且不改变任务状态", async () => {
+  const env = setup(); await env.board.ready;
+  const first = await env.board.save({ ...input, title: "普通高优先级" });
+  const pinned = await env.board.save({ ...input, title: "重点低优先级", priority: "low" });
+  await env.board.setPinned(pinned, true);
+  await env.board.save({ ...input, title: "重点低优先级", priority: "low" }, pinned);
+  for (const sort of ["priority", "created", "updated", "due"]) assert.equal(selectTasks(env.board.getSnapshot().tasks, { sort })[0].id, pinned);
+  assert.deepEqual(selectTasks(env.board.getSnapshot().tasks, { search: "普通" }).map((task) => task.id), [first]);
+  const restored = setup({ file: env.file() }); await restored.board.ready;
+  assert.equal(restored.board.getSnapshot().tasks.find((task) => task.id === pinned).pinned, true);
+  assert.equal(restored.board.getSnapshot().tasks.find((task) => task.id === pinned).status, "todo");
+  await restored.board.setPinned(pinned, false);
+  assert.equal(selectTasks(restored.board.getSnapshot().tasks)[0].id, first);
+  await assert.rejects(restored.board.setPinned(pinned, "yes"), /置顶状态/);
+  env.options.failWrite = true;
+  await assert.rejects(env.board.setPinned(first, true), /磁盘/);
+  assert.equal(env.board.getSnapshot().tasks.find((task) => task.id === first).pinned, undefined);
+  const bad = JSON.parse(env.file()); bad.tasks[0].pinned = "yes";
+  const invalid = setup({ file: JSON.stringify(bad) }); await invalid.board.ready;
+  assert.equal(invalid.board.getSnapshot().ready, false); assert.equal(invalid.calls.writes, 0);
+  env.board.dispose(); restored.board.dispose(); invalid.board.dispose();
+});
+
+test("快捷截止日期按本地日历跨月跨年，保持开始日期校验和运行中编辑保护", async () => {
+  assert.equal(dueDateShortcut(1, new Date(2026, 11, 31, 23, 30)), "2027-01-01");
+  assert.equal(dueDateShortcut(7, new Date(2026, 0, 28, 12)), "2026-02-04");
+  const env = setup(); await env.board.ready;
+  const id = await env.board.save({ ...input, startDate: "2026-11-02" });
+  await assert.rejects(env.board.editFields(id, { dueDate: "2026-11-01" }), /开始日期/);
+  await env.board.editFields(id, { dueDate: "2026-11-03" });
+  await env.board.editFields(id, { dueDate: "" });
+  assert.equal(env.board.getSnapshot().tasks[0].dueDate, "");
+  await env.board.start(id);
+  await env.board.setPinned(id, true);
+  await assert.rejects(env.board.editFields(id, { dueDate: "2026-11-03" }), /结束或核对/);
+  assert.equal(env.board.getSnapshot().tasks[0].status, "running");
+  env.board.dispose();
+});
+
+
+test("快捷开始日期保留其他字段，校验起止顺序并持久恢复", async () => {
+  const env = setup(); await env.board.ready;
+  const id = await env.board.save({ ...input, dueDate: "2026-12-31", tags: ["排期"], project: "插件" });
+  await env.board.editFields(id, { startDate: "2026-12-30" });
+  assert.equal(env.board.getSnapshot().tasks[0].dueDate, "2026-12-31");
+  const writes = env.calls.writes;
+  await assert.rejects(env.board.editFields(id, { startDate: "2027-01-01" }), /开始日期/);
+  await assert.rejects(env.board.editFields(id, { startDate: "2026-02-30" }), /有效的开始日期/);
+  assert.equal(env.calls.writes, writes);
+  const restored = setup({ file: env.file() }); await restored.board.ready;
+  assert.equal(restored.board.getSnapshot().tasks[0].startDate, "2026-12-30");
+  await restored.board.editFields(id, { startDate: "" });
+  assert.equal(restored.board.getSnapshot().tasks[0].startDate, "");
+  assert.equal(restored.board.getSnapshot().tasks[0].project, "插件");
+  assert.deepEqual(restored.board.getSnapshot().tasks[0].tags, ["排期"]);
+  env.board.dispose(); restored.board.dispose();
+});
+
+test("批量日期预校验全部任务，一次落盘，校验或存储失败整批不变", async () => {
+  const env = setup(); await env.board.ready;
+  const a = await env.board.save({ ...input, title: "任务甲", startDate: "2026-11-01" });
+  const b = await env.board.save({ ...input, title: "任务乙", startDate: "2026-12-01" });
+  const before = env.file(); const writes = env.calls.writes;
+  await assert.rejects(env.board.bulkUpdate([a, b], { dueDate: "2026-11-10" }), /任务乙.*未进行批量修改/);
+  await assert.rejects(env.board.bulkUpdate([a, b], { startDate: "2026-02-30" }), /有效的开始日期/);
+  await assert.rejects(env.board.bulkUpdate([a, b], { startDate: null }), /有效的日期/);
+  assert.equal(env.file(), before); assert.equal(env.calls.writes, writes);
+  await env.board.bulkUpdate([a, b], { startDate: "2027-01-01", dueDate: "2027-01-02" });
+  assert.equal(env.calls.writes, writes + 1);
+  assert.ok(env.board.getSnapshot().tasks.every((task) => task.startDate === "2027-01-01" && task.dueDate === "2027-01-02" && task.status === "todo"));
+  env.options.failWrite = true; const snapshot = env.board.getSnapshot().tasks;
+  await assert.rejects(env.board.bulkUpdate([a, b], { startDate: "" }), /磁盘/);
+  assert.equal(env.board.getSnapshot().tasks, snapshot);
+  env.options.failWrite = false;
+  await env.board.bulkUpdate([a, b], { startDate: "", dueDate: "" });
+  const restored = setup({ file: env.file() }); await restored.board.ready;
+  assert.ok(restored.board.getSnapshot().tasks.every((task) => task.startDate === "" && task.dueDate === ""));
+  assert.equal(env.calls.starts.length, 0); env.board.dispose(); restored.board.dispose();
+});
+
+test("批量排期拒绝运行中和待核对任务，不绕过运行恢复", async () => {
+  const env = setup(); await env.board.ready;
+  const a = await env.board.save(input); const b = await env.board.save({ ...input, title: "其他任务" });
+  await env.board.start(a); const writes = env.calls.writes;
+  await assert.rejects(env.board.bulkUpdate([b, a], { startDate: "2026-11-01" }), /未进行批量修改/);
+  await assert.rejects(env.board.editFields(a, { startDate: "2026-11-01" }), /结束或核对/);
+  assert.equal(env.calls.writes, writes);
+  const recovered = setup({ file: env.file() }); await recovered.board.ready;
+  await assert.rejects(recovered.board.bulkUpdate([a, b], { dueDate: "2026-11-02" }), /未进行批量修改/);
+  assert.ok(recovered.board.getSnapshot().tasks.every((task) => !task.dueDate));
+  env.board.dispose(); recovered.board.dispose();
 });

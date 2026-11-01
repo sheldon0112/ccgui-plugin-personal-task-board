@@ -943,3 +943,65 @@ test("成员头像选择预览与保存，切换保留草稿并在负责人、�
     assert.ok([...env.container.querySelectorAll('.ptb-agent-identity')].some((node) => node.textContent.includes("执行 Agent：开发助手") && node.querySelector('[data-avatar="owl"]')));
   } finally { await env.close(); }
 });
+
+
+test("任务快捷操作可置顶、调整及清除日期，写入失败可见且不触发执行", async () => {
+  const host = createTabHost(); let fail = false; let revision = 1; let starts = 0;
+  let stored = JSON.stringify({ schemaVersion: 1, tasks: [{ id: "t", title: "快捷操作验收", description: "需求", criteria: "标准", priority: "medium", workspacePath: "/repo", engine: "codex", model: "", status: "todo", recovery: false, createdAt: "2026-10-29", updatedAt: "2026-10-29", runs: [] }] });
+  const ctx = { pluginId: "personal-task-board", host: { isWeb: false }, react: React, ui: host.ui, storage: { get: async () => null, set: async () => {} }, events: { on: () => () => {} }, documentStorage: { readText: async () => ({ content: stored, version: String(revision) }), writeTextAtomic: async (_, content) => { if (fail) throw Error("写入失败"); stored = content; return { version: String(++revision) }; } }, workspaces: { list: async () => [] }, models: { listEngines: async () => [], catalog: async () => ({ engines: [], errors: [] }) }, sessions: { startRun: async () => { starts++; } } };
+  const dispose = activate(ctx); const container = document.createElement("div"); document.body.append(container); const root = createRoot(container);
+  try {
+    await act(async () => root.render(React.createElement(host.Component))); await settle();
+    await click("置顶"); assert.equal(JSON.parse(stored).tasks[0].pinned, true);
+    assert.equal(button("取消置顶", container).getAttribute("aria-pressed"), "true");
+    assert.match(container.querySelector('[aria-label="查看任务详情 快捷操作验收"]').textContent, /★/);
+    const dates = container.querySelector('[aria-label="快捷操作验收的快捷操作"] details'); dates.open = true;
+    await click("明天", dates); const tomorrow = new Date(); tomorrow.setDate(tomorrow.getDate() + 1);
+    const expected = `${tomorrow.getFullYear()}-${String(tomorrow.getMonth() + 1).padStart(2, "0")}-${String(tomorrow.getDate()).padStart(2, "0")}`;
+    assert.equal(JSON.parse(stored).tasks[0].dueDate, expected);
+    fail = true; await click("清除日期", dates); assert.match(container.querySelector('[role="alert"]').textContent, /写入失败/); assert.equal(JSON.parse(stored).tasks[0].dueDate, expected);
+    fail = false; await click("清除日期", dates); assert.equal(JSON.parse(stored).tasks[0].dueDate, "");
+    await act(async () => Simulate.click(container.querySelector('[aria-label="查看任务详情 快捷操作验收"]'))); await settle();
+    await click("取消置顶"); assert.equal(JSON.parse(stored).tasks[0].pinned, false);
+    assert.equal(starts, 0); assert.equal(JSON.parse(stored).tasks[0].status, "todo");
+  } finally { await act(async () => root.unmount()); dispose(); container.remove(); }
+});
+
+
+test("列表排期与置顶入口、筛选内批量日期及时间轴标识共用数据", async () => {
+  const host = createTabHost(); let fail = false; let revision = 1; let starts = 0;
+  const base = { description: "需求", criteria: "标准", priority: "medium", workspacePath: "/repo", engine: "codex", model: "", status: "todo", recovery: false, createdAt: "2026-10-29", updatedAt: "2026-10-29", runs: [] };
+  let stored = JSON.stringify({ schemaVersion: 1, tasks: [{ ...base, id: "a", title: "排期甲" }, { ...base, id: "b", title: "排期乙", startDate: "2028-01-01" }] });
+  const ctx = { pluginId: "personal-task-board", host: { isWeb: false }, react: React, ui: host.ui, storage: { get: async () => null, set: async () => {} }, events: { on: () => () => {} }, documentStorage: { readText: async () => ({ content: stored, version: String(revision) }), writeTextAtomic: async (_, content) => { if (fail) throw Error("写入失败"); stored = content; return { version: String(++revision) }; } }, workspaces: { list: async () => [] }, models: { listEngines: async () => [], catalog: async () => ({ engines: [], errors: [] }) }, sessions: { startRun: async () => { starts++; } } };
+  const dispose = activate(ctx); const container = document.createElement("div"); document.body.append(container); const root = createRoot(container);
+  const label = (text) => container.querySelector(`[aria-label="${text}"]`);
+  const set = async (text, value) => { await act(async () => Simulate.change(label(text), { target: { value } })); await settle(); };
+  const task = (id) => JSON.parse(stored).tasks.find((entry) => entry.id === id);
+  try {
+    await act(async () => root.render(React.createElement(host.Component))); await settle();
+    await switchLayout("list");
+    const quick = label("排期甲的快捷操作"); quick.closest("details").open = true;
+    await click("置顶", quick); assert.equal(task("a").pinned, true);
+    assert.match(container.querySelector("tbody tr.ptb-task-row .ptb-task-title").textContent, /★ 排期甲/);
+    const start = quick.querySelector('[aria-label="调整开始日期"]'); start.open = true;
+    await click("今天", start); assert.match(task("a").startDate, /^\d{4}-\d{2}-\d{2}$/);
+    await click("清除日期", start); assert.equal(task("a").startDate, "");
+    await act(async () => Simulate.click(quick.querySelector('[aria-label="编辑排期甲的开始日期"]'))); await settle();
+    assert.equal(label("修改开始日期").type, "date");
+    await set("修改开始日期", "2027-01-01"); await act(async () => Simulate.submit(start.querySelector("form"))); await settle(); assert.equal(task("a").startDate, "2027-01-01");
+    await click("选择筛选结果");
+    await set("批量日期", "2027-01-02");
+    const before = stored; await click("应用日期"); assert.equal(stored, before);
+    assert.match(container.querySelector('[role="alert"]').textContent, /排期乙.*未进行批量修改/);
+    const search = container.querySelector('.ptb-toolbar input');
+    await act(async () => Simulate.change(search, { target: { value: "排期甲" } })); await settle();
+    await click("应用日期"); assert.equal(task("a").dueDate, "2027-01-02"); assert.equal(task("b").dueDate, undefined);
+    fail = true; await click("清除所选日期"); assert.match(container.querySelector('[role="alert"]').textContent, /写入失败/); assert.equal(task("a").dueDate, "2027-01-02");
+    fail = false; await click("清除所选日期"); assert.equal(task("a").dueDate, "");
+    await set("批量日期字段", "startDate"); await click("清除所选日期"); assert.equal(task("a").startDate, ""); assert.equal(task("b").startDate, "2028-01-01");
+    await switchLayout("gantt"); assert.ok(button("★ 排期甲", container));
+    await set("批量日期字段", "dueDate"); await click("应用日期"); assert.equal(task("a").dueDate, "2027-01-02");
+    assert.match(container.querySelector('.ptb-gantt-name').textContent, /★ 排期甲/);
+    assert.equal(starts, 0); assert.ok(JSON.parse(stored).tasks.every((entry) => entry.status === "todo"));
+  } finally { await act(async () => root.unmount()); dispose(); container.remove(); }
+});

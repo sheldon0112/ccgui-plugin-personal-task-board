@@ -15,12 +15,17 @@ const LIST_FIELDS = { priority: "优先级", project: "项目", dueDate: "截止
 const CARD_DEFAULTS = { priority: true, updated: false, workspace: false, project: true, tags: false, dueDate: true, parent: true, model: false, requirements: false };
 const SORTS = { priority: "优先级", updated: "最近更新", created: "创建时间", due: "截止日期" };
 const localDate = (date = new Date()) => `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+export function dueDateShortcut(days, now = new Date()) {
+  const date = new Date(now);
+  date.setDate(date.getDate() + days);
+  return localDate(date);
+}
 export const isOverdue = (task, today = localDate()) => Boolean(task.dueDate && task.dueDate < today && !["done", "cancelled"].includes(task.status));
 export function selectTasks(tasks, { workspace = "", search = "", focus = "all", sort = "priority", project = "" } = {}) {
   return tasks.filter((task) => (!workspace || task.workspacePath === workspace) && (!project || task.project === project) &&
     `${task.title}\n${task.description}\n${task.criteria}\n${(task.tags || []).join(" ")}\n${task.project || ""}`.toLowerCase().includes(search.trim().toLowerCase()) &&
     (focus === "revision" ? (Boolean(task.pendingFeedbackIds?.length) || task.comments?.some((entry) => entry.triggerAgent && !entry.resolvedAt)) && ["todo", "blocked"].includes(task.status) : focus === "overdue" ? isOverdue(task) : true))
-    .sort((a, b) => (sort === "updated" ? b.updatedAt.localeCompare(a.updatedAt) : sort === "created" ? (b.createdAt || "").localeCompare(a.createdAt || "") : sort === "due" ? (a.dueDate || "9999").localeCompare(b.dueDate || "9999") : Object.keys(PRIORITIES).indexOf(a.priority) - Object.keys(PRIORITIES).indexOf(b.priority)) || b.updatedAt.localeCompare(a.updatedAt));
+    .sort((a, b) => Number(b.pinned === true) - Number(a.pinned === true) || (sort === "updated" ? b.updatedAt.localeCompare(a.updatedAt) : sort === "created" ? (b.createdAt || "").localeCompare(a.createdAt || "") : sort === "due" ? (a.dueDate || "9999").localeCompare(b.dueDate || "9999") : Object.keys(PRIORITIES).indexOf(a.priority) - Object.keys(PRIORITIES).indexOf(b.priority)) || b.updatedAt.localeCompare(a.updatedAt));
 }
 const viewFields = (value) => ({ openMode: value?.openMode === "preview" ? "preview" : "details", listFields: Object.fromEntries(Object.keys(LIST_FIELDS).map((key) => [key, value?.listFields?.[key] !== false])), layout: ["list", "gantt", "swimlane"].includes(value?.layout) ? value.layout : "board", cardFields: Object.fromEntries(Object.keys(CARD_FIELDS).map((key) => [key, typeof value?.cardFields?.[key] === "boolean" ? value.cardFields[key] : CARD_DEFAULTS[key]])), collapsedLanes: Array.isArray(value?.collapsedLanes) ? value.collapsedLanes.filter((key) => typeof key === "string") : [], project: typeof value?.project === "string" ? value.project : "", workspace: typeof value?.workspace === "string" ? value.workspace : "", search: typeof value?.search === "string" ? value.search : "", focus: Object.hasOwn(FOCUSES, value?.focus) ? value.focus : "all", sort: Object.hasOwn(SORTS, value?.sort) ? value.sort : "priority", collapsed: Array.isArray(value?.collapsed) ? value.collapsed.filter((key) => Object.hasOwn(STATUSES, key)) : [] });
 
@@ -383,6 +388,7 @@ function parseDocument(content) {
       for (const [key, config] of Object.entries(task.stepConfigs)) if (normalizeStep(config).step !== key) throw new Error("步骤配置无效，原文件已保留。");
     }
     if (task.noticeStates != null && (typeof task.noticeStates !== "object" || Array.isArray(task.noticeStates) || Object.values(task.noticeStates).some((entry) => !entry || typeof entry !== "object" || Array.isArray(entry) || Object.entries(entry).some(([key, value]) => !["read", "archived"].includes(key) || typeof value !== "boolean")))) throw new Error("通知记录无效，原文件已保留。");
+    if (task.pinned != null && typeof task.pinned !== "boolean") throw new Error("置顶记录无效，原文件已保留。");
     if ((task.project != null && typeof task.project !== "string") || (task.stage != null && (typeof task.stage !== "number" || !Number.isInteger(task.stage) || task.stage < 1)) || (task.tags != null && !Array.isArray(task.tags)) || (task.dueDate != null && typeof task.dueDate !== "string") || (task.startDate != null && (typeof task.startDate !== "string" || (task.startDate && !validDate(task.startDate)) || (task.dueDate && task.startDate > task.dueDate)))) throw new Error("任务标签或日期记录无效，原文件已保留。");
     if (typeof task.id !== "string" || !task.id || ids.has(task.id) || !Object.hasOwn(STATUSES, task.status) ||
         typeof task.createdAt !== "string" || typeof task.updatedAt !== "string" || typeof task.recovery !== "boolean" || !Array.isArray(task.runs)) {
@@ -715,12 +721,20 @@ export function createBoard(ctx) {
         await replaceTask(taskId, (current) => ({ ...current, noticeStates: { ...current.noticeStates, [runId]: { ...current.noticeStates?.[runId], ...fields } } }));
       });
     },
+    async setPinned(id, pinned) {
+      return enqueue(async () => {
+        requireReady();
+        findTask(id);
+        if (typeof pinned !== "boolean") throw new Error("置顶状态无效。");
+        await replaceTask(id, (task) => ({ ...task, pinned }));
+      });
+    },
     async editFields(id, patch) {
       return enqueue(async () => {
         requireReady();
         const task = findTask(id);
         if (task.status === "running" || task.recovery) throw new Error("请先结束或核对这项任务的执行，再编辑。");
-        const fields = Object.fromEntries(["title", "priority", "dueDate"].filter((key) => Object.hasOwn(patch, key)).map((key) => [key, patch[key]]));
+        const fields = Object.fromEntries(["title", "priority", "startDate", "dueDate"].filter((key) => Object.hasOwn(patch, key)).map((key) => [key, patch[key]]));
         const validated = validateTask({ ...task, tags: (task.tags || []).join(", "), ...fields });
         await replaceTask(id, (current) => ({ ...current, ...validated }));
       });
@@ -732,8 +746,19 @@ export function createBoard(ctx) {
         const fields = {};
         if (Object.hasOwn(patch, "priority")) { if (!Object.hasOwn(PRIORITIES, patch.priority)) throw new Error("优先级无效。"); fields.priority = patch.priority; }
         if (Object.hasOwn(patch, "status")) { if (!["todo", "cancelled"].includes(patch.status)) throw new Error("批量状态仅支持待办或取消，完成仍需逐项验收。"); fields.status = patch.status; fields.duplicateOf = null; }
+        for (const key of ["startDate", "dueDate"]) {
+          if (Object.hasOwn(patch, key)) {
+            if (typeof patch[key] !== "string") throw new Error("请选择有效的日期，或使用清除日期。");
+            fields[key] = patch[key];
+          }
+        }
         if (!Object.keys(fields).length) throw new Error("没有可修改的字段。");
-        for (const id of ids) { const task = findTask(id); if (task.status === "running" || task.recovery) throw new Error("所选任务含执行中或待核对任务，未进行批量修改。"); }
+        for (const id of ids) {
+          const task = findTask(id);
+          if (task.status === "running" || task.recovery) throw new Error("所选任务含执行中或待核对任务，未进行批量修改。");
+          try { validateTask({ ...task, ...fields }); }
+          catch (error) { throw new Error(`${task.title}：${message(error)} 未进行批量修改。`); }
+        }
         await persist(state.tasks.map((task) => ids.includes(task.id) ? { ...task, ...fields, updatedAt: timestamp() } : task));
       });
     },
@@ -1594,6 +1619,7 @@ export default function activate(ctx) {
         h("label", { className: "ptb-field ptb-assignee-field" }, h("span", null, "任务负责人"), h("select", { "aria-label": "任务负责人", value: task.assigneeId || "", disabled: task.status === "running" || task.recovery, onChange: (event) => void act(() => board.assignAgent(task.id, event.target.value)) }, h("option", { value: "" }, "我"), ...state.agents.filter((agent) => !agent.archived || agent.id === task.assigneeId).map((agent) => h("option", { key: agent.id, value: agent.id }, `${avatarSymbol(agent)} ${agent.name}${agent.archived ? "（已归档）" : ""}`))))),
 
             h("dl", { className: "ptb-detail-properties" }, ...[["工作区", task.workspacePath], ["项目", task.project], ["执行引擎", task.engine], ["模型", task.model || "宿主默认模型"], ["开始日期", task.startDate], ["截止日期", task.dueDate ? `${task.dueDate}${isOverdue(task) ? "（已逾期）" : ""}` : ""]].filter(([, value]) => value).map(([label, value]) => h("div", { key: label }, h("dt", null, label), h("dd", null, value)))),
+        h(TaskQuickActions, { task, disabled: state.busy, act }),
         h(TaskRelations, { key: `relations:${task.id}`, task, tasks: state.tasks, act }),
 
         h(AttachmentSummary, { key: `files:${task.id}`, task, act }),
@@ -1622,12 +1648,23 @@ export default function activate(ctx) {
       h(TaskDetails, { key: task.id, taskId: task.id, onClose }));
   }
 
+  function TaskQuickActions({ task, disabled, act }) {
+    const dateLocked = disabled || task.status === "running" || task.recovery;
+    return h("div", { className: "ptb-actions", "aria-label": `${task.title}的快捷操作` },
+      button(task.pinned ? "取消置顶" : "置顶", () => void act(() => board.setPinned(task.id, !task.pinned)), { disabled, "aria-pressed": task.pinned === true }),
+      ...[["dueDate", "截止日期"], ["startDate", "开始日期"]].map(([field, label]) =>
+        h("details", { key: field, "aria-label": `调整${label}` }, h("summary", null, `调整${label}`),
+          h(InlineField, { task, field, disabled: dateLocked }),
+          h("div", { className: "ptb-actions" }, ...[["今天", 0], ["明天", 1], ["一周后", 7], ["清除日期", null]].map(([text, days]) =>
+            button(text, () => void act(() => board.editFields(task.id, { [field]: days === null ? "" : dueDateShortcut(days) })), { key: text, disabled: dateLocked || (days === null && !task[field]) }))))));
+  }
+
   function InlineField({ task, field, disabled }) {
     const [editing, setEditing] = useState(false);
     const [value, setValue] = useState("");
     const [saving, setSaving] = useState(false);
     const [error, setError] = useState("");
-    const label = { title: "标题", priority: "优先级", dueDate: "截止日期" }[field];
+    const label = { title: "标题", priority: "优先级", startDate: "开始日期", dueDate: "截止日期" }[field];
     if (!editing) return button(field === "title" ? "改标题" : field === "priority" ? PRIORITIES[task[field]] : task[field] || "—", () => { setValue(task[field] || ""); setError(""); setEditing(true); }, { disabled, className: "ptb-inline-trigger", "aria-label": `编辑${task.title}的${label}` });
     async function save(event) {
       event.preventDefault();
@@ -1639,7 +1676,7 @@ export default function activate(ctx) {
     }
     const props = { "aria-label": `修改${label}`, value, disabled: saving || disabled, autoFocus: true, onChange: (event) => setValue(event.target.value) };
     return h("form", { className: "ptb-inline-form", onSubmit: save, onKeyDown: (event) => { if (event.key === "Escape" && !saving) { event.stopPropagation(); setEditing(false); } } },
-      field === "priority" ? h("select", props, ...Object.entries(PRIORITIES).map(([key, text]) => h("option", { key, value: key }, text))) : h("input", { ...props, type: field === "dueDate" ? "date" : "text" }),
+      field === "priority" ? h("select", props, ...Object.entries(PRIORITIES).map(([key, text]) => h("option", { key, value: key }, text))) : h("input", { ...props, type: ["startDate", "dueDate"].includes(field) ? "date" : "text" }),
       h("button", { type: "submit", disabled: saving || disabled }, saving ? "保存中…" : "保存"),
       button("取消", () => setEditing(false), { type: "button", disabled: saving }),
       error && h("span", { role: "alert", className: "ptb-error" }, error));
@@ -1809,6 +1846,8 @@ export default function activate(ctx) {
     const [pending, setPending] = useState(false);
     const [selected, setSelected] = useState([]);
     const [batchPriority, setBatchPriority] = useState("medium");
+    const [batchDateField, setBatchDateField] = useState("dueDate");
+    const [batchDate, setBatchDate] = useState("");
     const [previewId, setPreviewId] = useState(null);
     const searchInput = useRef(null);
     const selectionAnchor = useRef(null);
@@ -1852,8 +1891,9 @@ export default function activate(ctx) {
       return h("article", { key: task.id, className: "ptb-card", "aria-label": task.title },
         h("div", { className: "ptb-card-meta" }, h("input", { type: "checkbox", "aria-label": `选择任务 ${task.title}`, checked: selectedVisible.includes(task.id), disabled: locked || task.status === "running" || task.recovery, onChange: (event) => setSelected((current) => event.target.checked ? [...current, task.id] : current.filter((id) => id !== task.id)) }), view.cardFields.priority && h("span", { className: `ptb-priority ptb-${task.priority}` }, `${PRIORITIES[task.priority]}优先级`), view.cardFields.updated && h("span", null, new Date(task.updatedAt).toLocaleDateString("zh-CN"))),
         h("div", { className: "ptb-card-heading" },
-          h("h3", null, button(task.title, (event) => openTask(event, task), { className: "ptb-task-title", "aria-label": `查看任务详情 ${task.title}` })),
+          h("h3", null, button(`${task.pinned ? "★ " : ""}${task.title}`, (event) => openTask(event, task), { className: "ptb-task-title", "aria-label": `查看任务详情 ${task.title}` })),
           button("预览", (event) => openTask(event, task, true), { className: "ptb-card-preview", "aria-label": `预览任务 ${task.title}` })),
+        h("details", { className: "ptb-card-tools" }, h("summary", null, "快捷操作"), h(TaskQuickActions, { task, disabled: locked, act })),
         task.assigneeId && h("p", { className: "ptb-agent-identity ptb-card-assignee" }, h(AgentAvatar, { agent: state.agents.find((agent) => agent.id === task.assigneeId) }), state.agents.find((agent) => agent.id === task.assigneeId)?.name),
         view.cardFields.workspace && h("p", { className: "ptb-path", title: task.workspacePath }, workspace?.name || task.workspacePath.split(/[\\/]/).pop()),
         metadata.length > 0 && h("p", { className: view.cardFields.dueDate && isOverdue(task) ? "ptb-error" : "ptb-muted" }, metadata.join(" · ")),
@@ -1943,6 +1983,11 @@ export default function activate(ctx) {
           button("应用优先级", () => void act(() => board.bulkUpdate(selectedVisible, { priority: batchPriority })), { disabled: locked || !selectedVisible.length }),
           button("批量移回待办", () => void act(() => board.bulkUpdate(selectedVisible, { status: "todo" })), { disabled: locked || !selectedVisible.length }),
           button("批量取消", () => void act(() => board.bulkUpdate(selectedVisible, { status: "cancelled" })), { disabled: locked || !selectedVisible.length })),
+        h("div", { className: "ptb-actions ptb-batch" },
+          h("label", null, "批量排期 ", h("select", { "aria-label": "批量日期字段", value: batchDateField, disabled: locked, onChange: (event) => setBatchDateField(event.target.value) }, h("option", { value: "startDate" }, "开始日期"), h("option", { value: "dueDate" }, "截止日期"))),
+          h("input", { type: "date", "aria-label": "批量日期", value: batchDate, disabled: locked, onChange: (event) => setBatchDate(event.target.value) }),
+          button("应用日期", () => void act(() => board.bulkUpdate(selectedVisible, { [batchDateField]: batchDate })), { disabled: locked || !selectedVisible.length || !batchDate }),
+          button("清除所选日期", () => void act(() => board.bulkUpdate(selectedVisible, { [batchDateField]: "" })), { disabled: locked || !selectedVisible.length })),
         h("details", null, h("summary", null, "项目进度"), ...[...new Set(state.tasks.filter((task) => (!filter || task.workspacePath === filter) && task.project).map((task) => task.project))].map((project) => {
           const projectTasks = state.tasks.filter((task) => task.project === project && (!filter || task.workspacePath === filter));
           const ended = projectTasks.filter((task) => ["done", "cancelled"].includes(task.status)).length;
@@ -1959,7 +2004,7 @@ export default function activate(ctx) {
           (index === 0 || tasks[index - 1].status !== task.status) && h("tr", { key: `group-${task.status}`, className: `ptb-list-group ptb-status-${task.status}` }, h("th", { colSpan: 3 + Object.values(view.listFields).filter(Boolean).length }, h("span", { className: "ptb-dot", "aria-hidden": true }), `${STATUSES[task.status]} · ${tasks.filter((entry) => entry.status === task.status).length}`)),
           h("tr", { key: task.id, className: `ptb-task-row${previewId === task.id ? " ptb-row-selected" : ""}` },
           h("td", null, h("input", { type: "checkbox", "aria-label": `选择任务 ${task.title}`, checked: selectedVisible.includes(task.id), disabled: locked || task.status === "running" || task.recovery, onChange: (event) => selectTask(event, task) })),
-          h("td", null, h("div", { className: "ptb-list-task" }, button(task.title, (event) => openTask(event, task), { className: "ptb-task-title" }), h("div", { className: "ptb-actions ptb-list-task-actions" }, button("预览", (event) => openTask(event, task, true), { "aria-label": `预览任务 ${task.title}` }), h(InlineField, { task, field: "title", disabled: locked || task.status === "running" || task.recovery }))), task.parentId && h("span", { className: "ptb-muted" }, `子任务/阶段 ${task.stage || 1}`)),
+          h("td", null, h("div", { className: "ptb-list-task" }, button(`${task.pinned ? "★ " : ""}${task.title}`, (event) => openTask(event, task), { className: "ptb-task-title" }), h("div", { className: "ptb-actions ptb-list-task-actions" }, button("预览", (event) => openTask(event, task, true), { "aria-label": `预览任务 ${task.title}` }), h(InlineField, { task, field: "title", disabled: locked || task.status === "running" || task.recovery })), h("details", null, h("summary", null, "快捷操作"), h(TaskQuickActions, { task, disabled: locked, act }))), task.parentId && h("span", { className: "ptb-muted" }, `子任务/阶段 ${task.stage || 1}`)),
           h("td", null, h("span", { className: `ptb-status-label ptb-status-${task.status}` }, STATUSES[task.status])), view.listFields.priority && h("td", null, h(InlineField, { task, field: "priority", disabled: locked || task.status === "running" || task.recovery })), view.listFields.project && h("td", null, task.project || "—"), view.listFields.dueDate && h("td", { className: isOverdue(task) ? "ptb-error" : "" }, h(InlineField, { task, field: "dueDate", disabled: locked || task.status === "running" || task.recovery })), view.listFields.workspace && h("td", null, resources.workspaces.find((entry) => entry.path === task.workspacePath)?.name || task.workspacePath))]),
           !tasks.length && h("tr", null, h("td", { colSpan: 3 + Object.values(view.listFields).filter(Boolean).length }, "没有符合筛选的任务"))))),
       state.ready && state.tasks.length > 0 && view.layout === "gantt" && (() => {
@@ -1967,9 +2012,9 @@ export default function activate(ctx) {
         return h("div", { className: "ptb-gantt", "aria-label": "甘特时间轴" },
           timeline.start && h("div", { className: "ptb-gantt-range" }, h("span", null, timeline.start), h("span", null, timeline.end)),
           ...timeline.rows.map(({ task, left, width }) => h("div", { key: task.id, className: `ptb-gantt-row ptb-status-${task.status}` },
-            button(task.title, () => setPreviewId(task.id), { title: task.title, className: "ptb-gantt-name" }),
+            button(`${task.pinned ? "★ " : ""}${task.title}`, () => setPreviewId(task.id), { title: task.title, className: "ptb-gantt-name" }),
             h("div", { className: "ptb-gantt-track" }, button(`${task.startDate || "未设开始"} → ${task.dueDate || "未设截止"}`, () => setPreviewId(task.id), { className: `ptb-gantt-bar${!task.startDate || !task.dueDate ? " ptb-gantt-point" : ""}`, style: { left: `${left}%`, width: `${width}%` }, title: `${task.title}：${task.startDate || "未设开始日期"} → ${task.dueDate || "未设截止日期"}`, "aria-label": `预览任务 ${task.title}` })))),
-          timeline.unscheduled.length > 0 && h("div", { className: "ptb-gantt-unscheduled" }, h("h2", null, "未排期"), ...timeline.unscheduled.map((task) => h("p", { key: task.id }, button(task.title, () => setPreviewId(task.id))))),
+          timeline.unscheduled.length > 0 && h("div", { className: "ptb-gantt-unscheduled" }, h("h2", null, "未排期"), ...timeline.unscheduled.map((task) => h("p", { key: task.id }, button(`${task.pinned ? "★ " : ""}${task.title}`, () => setPreviewId(task.id))))),
           !tasks.length && h("p", null, "没有符合筛选的任务"));
       })(),
       state.ready && state.tasks.length > 0 && view.layout === "board" && h("div", { className: "ptb-columns" }, ...Object.entries(STATUSES).map(([status, label]) => {
