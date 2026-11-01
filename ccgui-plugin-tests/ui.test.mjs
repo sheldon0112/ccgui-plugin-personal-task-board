@@ -292,7 +292,7 @@ test("附件 UI：分区选择、去重、移除、取消、错误、保存后�
     assert.equal(list("需求").children.length, 1);
     assert.equal(list("验收标准").children.length, 0);
     assert.equal(field("需求").required, false);
-    assert.equal(field("验收标准").required, true);
+    assert.equal(field("验收标准").required, false);
     await upload("需求");
     assert.equal(list("需求").children.length, 1);
     pick = null; await upload("需求");
@@ -305,7 +305,7 @@ test("附件 UI：分区选择、去重、移除、取消、错误、保存后�
     assert.equal(field("验收标准").required, false);
     await act(async () => Simulate.click(document.querySelector('button[aria-label="移除需求附件 需求 🧩.pdf"]'))); await settle();
     assert.equal(list("需求").children.length, 0);
-    assert.equal(field("需求").required, true);
+    assert.equal(field("需求").required, false);
     pick = { path: "/files", relativePath: "需求 🧩.pdf", grantId: "g1" }; await upload("需求");
     await act(async () => Simulate.submit(document.querySelector("form"))); await settle();
     const task = JSON.parse(stored).tasks[0];
@@ -576,11 +576,11 @@ test("列表列隐藏、Shift 连选与预览偏好共用任务，设置恢复�
   const value = async (name, text) => { await act(async () => Simulate.change(label(name), { target: { value: text } })); await settle(); };
   try {
     await act(async () => root.render(React.createElement(host.Component))); await settle(); await switchLayout("list");
-    assert.equal(container.querySelectorAll("thead th").length, 7);
+    assert.equal(container.querySelectorAll("thead th").length, 8);
     await click("任务面板配置");
     const fieldset = [...container.querySelectorAll("fieldset")].find((node) => node.querySelector("legend").textContent === "列表显示列");
     const workspace = [...fieldset.querySelectorAll("label")].find((node) => node.textContent === "工作区").querySelector("input");
-    await act(async () => Simulate.change(workspace, { target: { checked: false } })); await settle(); await click("返回任务面板"); assert.equal(container.querySelectorAll("thead th").length, 6); assert.equal(container.querySelector("tbody tr.ptb-task-row").children.length, 6);
+    await act(async () => Simulate.change(workspace, { target: { checked: false } })); await settle(); await click("返回任务面板"); assert.equal(container.querySelectorAll("thead th").length, 7); assert.equal(container.querySelector("tbody tr.ptb-task-row").children.length, 7);
     await act(async () => Simulate.change(label("选择任务 甲"), { target: { checked: true } })); await settle();
     await act(async () => Simulate.change(label("选择任务 丙"), { target: { checked: true }, nativeEvent: { shiftKey: true } })); await settle();
     assert.equal(container.querySelectorAll("tbody input:checked").length, 3);
@@ -619,7 +619,8 @@ test("通知铃铛位于新建任务左侧，历史重试先展示快照且确�
     await act(async () => root.render(React.createElement(host.Component))); await settle();
     const toolbar = container.querySelector(".ptb-toolbar"), focus = container.querySelector(".ptb-focus"), notices = container.querySelector(".ptb-notices");
     assert.ok(notices.closest(".ptb-board-header"));
-    assert.equal(notices.nextElementSibling.textContent, "＋ 新建任务");
+    assert.equal(notices.nextElementSibling.textContent, "快速创建");
+    assert.equal(notices.nextElementSibling.nextElementSibling.textContent, "＋ 新建任务");
     assert.ok(toolbar.compareDocumentPosition(focus) & window.Node.DOCUMENT_POSITION_FOLLOWING);
     notices.open = true;
     await act(async () => Simulate.keyDown(notices.querySelector("summary"), { key: "Escape" })); await settle();
@@ -955,7 +956,7 @@ test("任务快捷操作可置顶、调整及清除日期，写入失败可见�
     await click("置顶"); assert.equal(JSON.parse(stored).tasks[0].pinned, true);
     assert.equal(button("取消置顶", container).getAttribute("aria-pressed"), "true");
     assert.match(container.querySelector('[aria-label="查看任务详情 快捷操作验收"]').textContent, /★/);
-    const dates = container.querySelector('[aria-label="快捷操作验收的快捷操作"] details'); dates.open = true;
+    const dates = container.querySelector('[aria-label="快捷操作验收的快捷操作"] details[aria-label="调整截止日期"]'); dates.open = true;
     await click("明天", dates); const tomorrow = new Date(); tomorrow.setDate(tomorrow.getDate() + 1);
     const expected = `${tomorrow.getFullYear()}-${String(tomorrow.getMonth() + 1).padStart(2, "0")}-${String(tomorrow.getDate()).padStart(2, "0")}`;
     assert.equal(JSON.parse(stored).tasks[0].dueDate, expected);
@@ -1003,5 +1004,119 @@ test("列表排期与置顶入口、筛选内批量日期及时间轴标识共�
     await set("批量日期字段", "dueDate"); await click("应用日期"); assert.equal(task("a").dueDate, "2027-01-02");
     assert.match(container.querySelector('.ptb-gantt-name').textContent, /★ 排期甲/);
     assert.equal(starts, 0); assert.ok(JSON.parse(stored).tasks.every((entry) => entry.status === "todo"));
+  } finally { await act(async () => root.unmount()); dispose(); container.remove(); }
+});
+
+test("快速创建：标题草稿、保存并再建、Esc 关闭、展开为完整表单", async () => {
+  const host = createTabHost(); const prefs = new Map(); let stored = JSON.stringify({ schemaVersion: 1, tasks: [] }); let revision = 1;
+  const ctx = { pluginId: "personal-task-board", host: { isWeb: false }, react: React, ui: host.ui, storage: { get: async (key) => prefs.get(key), set: async (key, value) => prefs.set(key, value) }, events: { on: () => () => {} }, documentStorage: { readText: async () => ({ content: stored, version: String(revision) }), writeTextAtomic: async (_, content) => { stored = content; return { version: String(++revision) }; } }, workspaces: { list: async () => [{ path: "/repo", name: "仓库" }] }, models: { listEngines: async () => [{ id: "codex", available: true, enabled: true }], catalog: async () => ({ engines: [], errors: [] }) }, sessions: {} };
+  const dispose = activate(ctx); const container = document.createElement("div"); document.body.append(container); const root = createRoot(container);
+  try {
+    await act(async () => root.render(React.createElement(host.Component))); await settle();
+    await click("快速创建");
+    const dialog = container.querySelector(".ptb-quick-modal");
+    assert.ok(dialog, "快速创建弹窗已打开");
+    const titleInput = dialog.querySelector("input");
+    await act(async () => Simulate.change(titleInput, { target: { value: "快速记一条" } })); await settle();
+    await click("保存并再建一条", container);
+    assert.equal(JSON.parse(stored).tasks.length, 1);
+    assert.ok(container.querySelector(".ptb-quick-modal"), "再建后弹窗保持打开");
+    await act(async () => Simulate.change(container.querySelector(".ptb-quick-modal input"), { target: { value: "第二条快速任务" } })); await settle();
+    await act(async () => Simulate.submit(container.querySelector(".ptb-quick-modal form"))); await settle();
+    assert.equal(JSON.parse(stored).tasks.length, 2);
+    assert.ok(!container.querySelector(".ptb-quick-modal"), "保存后关闭");
+    const saved = JSON.parse(stored).tasks[0];
+    assert.equal(saved.status, "todo");
+    assert.ok(!saved.description && !saved.criteria, "草稿任务需求与验收为空");
+    await click("快速创建");
+    assert.ok(container.querySelector(".ptb-quick-modal"));
+    await act(async () => Simulate.keyDown(container.querySelector(".ptb-quick-modal"), { key: "Escape" })); await settle();
+    assert.ok(!container.querySelector(".ptb-quick-modal"), "Esc 关闭弹窗");
+  } finally { await act(async () => root.unmount()); dispose(); container.remove(); }
+});
+
+test("通知分级chip与仅看需处理过滤", async () => {
+  const host = createTabHost(); const prefs = new Map();
+  const run = (id, outcome, endedAt) => ({ id, runId: id, sessionId: id, engine: "codex", model: "", workspacePath: "/repo", startedAt: "2026-10-29T01:00:00Z", endedAt, outcome });
+  const tasks = [
+    { id: "a", title: "失败任务", description: "需求", criteria: "验收", priority: "medium", workspacePath: "/repo", engine: "codex", status: "blocked", recovery: false, createdAt: "2026-10-29", updatedAt: "2026-10-29", runs: [run("r-a", "error", "2026-10-29T02:00:00Z")] },
+    { id: "b", title: "待验收任务", description: "需求", criteria: "验收", priority: "medium", workspacePath: "/repo", engine: "codex", status: "review", recovery: false, createdAt: "2026-10-29", updatedAt: "2026-10-29", runs: [run("r-b", "ended", "2026-10-29T03:00:00Z")] },
+    { id: "c", title: "完成", description: "需求", criteria: "验收", priority: "medium", workspacePath: "/repo", engine: "codex", status: "done", recovery: false, createdAt: "2026-10-29", updatedAt: "2026-10  -29", runs: [run("r-c", "ended", "2026-10-29T04:00:00Z")] },
+  ];
+  const ctx = { pluginId: "personal-task-board", host: { isWeb: false }, react: React, ui: host.ui, storage: { get: async (key) => prefs.get(key), set: async (key, value) => prefs.set(key, value) }, events: { on: () => () => {} }, documentStorage: { readText: async () => ({ content: JSON.stringify({ schemaVersion: 1, tasks }), version: "1" }), writeTextAtomic: async () => { throw Error("不应修改任务"); } }, workspaces: { list: async () => [] }, models: { listEngines: async () => [] }, sessions: {} };
+  const dispose = activate(ctx); const container = document.createElement("div"); document.body.append(container); const root = createRoot(container);
+  try {
+    await act(async () => root.render(React.createElement(host.Component))); await settle();
+    const notices = container.querySelector(".ptb-notices");
+    notices.open = true;
+    await settle();
+    assert.equal(container.querySelectorAll(".ptb-notice-severity").length, 3);
+    assert.equal(container.querySelector(".ptb-sev-action").textContent, "需处理");
+    await click("仅看需处理", container);
+    const visible = [...container.querySelectorAll(".ptb-notice")];
+    assert.equal(visible.length, 1);
+    assert.ok(visible[0].querySelector(".ptb-sev-action"));
+    assert.ok(container.querySelector('[aria-pressed="true"]'), "过滤按钮处于按压态");
+  } finally { await act(async () => root.unmount()); dispose(); container.remove(); }
+});
+
+test("预览内左右键切换状态列", async () => {
+  const host = createTabHost(); const prefs = new Map();
+  const base = { description: "需求", criteria: "验收", priority: "medium", workspacePath: "/repo", engine: "codex", model: "", recovery: false, runs: [], createdAt: "2026-10-29", updatedAt: "2026-10-29" };
+  const tasks = [{ ...base, id: "t-todo", title: "待办任务", status: "todo" }, { ...base, id: "t-review", title: "待验收任务", status: "review" }];
+  const ctx = { pluginId: "personal-task-board", host: { isWeb: false }, react: React, ui: host.ui, storage: { get: async (key) => prefs.get(key), set: async (key, value) => prefs.set(key, value) }, events: { on: () => () => {} }, documentStorage: { readText: async () => ({ content: JSON.stringify({ schemaVersion: 1, tasks }), version: "1" }), writeTextAtomic: async () => { throw Error("不应修改任务"); } }, workspaces: { list: async () => [] }, models: { listEngines: async () => [] }, sessions: {} };
+  const dispose = activate(ctx); const container = document.createElement("div"); document.body.append(container); const root = createRoot(container);
+  try {
+    await act(async () => root.render(React.createElement(host.Component))); await settle();
+    await click("预览任务 待办任务", container);
+    assert.ok(container.querySelector(".ptb-preview"));
+    assert.equal(container.querySelector(".ptb-preview h1").textContent, "待办任务");
+    await act(async () => Simulate.keyDown(container.querySelector(".ptb-preview"), { key: "l" })); await settle();
+    assert.equal(container.querySelector(".ptb-preview h1").textContent, "待验收任务", "L 切到下一列");
+    await act(async () => Simulate.keyDown(container.querySelector(".ptb-preview"), { key: "H" })); await settle();
+    assert.equal(container.querySelector(".ptb-preview h1").textContent, "待办任务", "H 切回上一列");
+  } finally { await act(async () => root.unmount()); dispose(); container.remove(); }
+});
+
+test("手动排序上移下移写入 order 并按手动排序显示", async () => {
+  const host = createTabHost(); const prefs = new Map(); let stored = JSON.stringify({ schemaVersion: 1, tasks: [
+    { id: "1", title: "第一", description: "需求", criteria: "验收", priority: "medium", workspacePath: "/repo", engine: "codex", status: "todo", recovery: false, createdAt: "2026-10-29", updatedAt: "2026-10-29", runs: [] },
+    { id: "2", title: "第二", description: "需求", criteria: "验收", priority: "medium", workspacePath: "/repo", engine: "codex", status: "todo", recovery: false, createdAt: "2026-10-29", updatedAt: "2026-10-29", runs: [] },
+    { id: "3", title: "第三", description: "需求", criteria: "验收", priority: "medium", workspacePath: "/repo", engine: "codex", status: "todo", recovery: false, createdAt: "2026-10-29", updatedAt: "2026-10-29", runs: [] },
+  ] }); let revision = 1;
+  const ctx = { pluginId: "personal-task-board", host: { isWeb: false }, react: React, ui: host.ui, storage: { get: async (key) => prefs.get(key), set: async (key, value) => prefs.set(key, value) }, events: { on: () => () => {} }, documentStorage: { readText: async () => ({ content: stored, version: String(revision) }), writeTextAtomic: async (_, content) => { stored = content; return { version: String(++revision) }; } }, workspaces: { list: async () => [{ path: "/repo", name: "仓库" }] }, models: { listEngines: async () => [{ id: "codex", available: true, enabled: true }], catalog: async () => ({ engines: [], errors: [] }) }, sessions: {} };
+  const dispose = activate(ctx); const container = document.createElement("div"); document.body.append(container); const root = createRoot(container);
+  try {
+    await act(async () => root.render(React.createElement(host.Component))); await settle();
+    const sortSelect = container.querySelector('[aria-label="任务排序"]');
+    await act(async () => Simulate.change(sortSelect, { target: { value: "manual" } })); await settle();
+    assert.ok(container.querySelector('.ptb-card[draggable="true"]'), "手动排序下卡片可拖拽");
+    await click("下移 第一", container);
+    const saved = JSON.parse(stored).tasks;
+    assert.equal(saved.find((task) => task.id === "2").order, 0, "第二张卡移到首位");
+    assert.equal(saved.find((task) => task.id === "1").order, 1);
+  } finally { await act(async () => root.unmount()); dispose(); container.remove(); }
+});
+
+test("草稿任务在完整编辑器可仅改标题保存，需求与验收不强制 required", async () => {
+  const host = createTabHost(); const prefs = new Map();
+  let stored = JSON.stringify({ schemaVersion: 1, tasks: [{ id: "d", title: "草稿卡", description: "", criteria: "", priority: "medium", workspacePath: "/repo", engine: "codex", status: "todo", recovery: false, createdAt: "2026-10-29", updatedAt: "2026-10-29", runs: [] }] }); let revision = 1;
+  const ctx = { pluginId: "personal-task-board", host: { isWeb: false }, react: React, ui: host.ui, storage: { get: async (key) => prefs.get(key), set: async (key, value) => prefs.set(key, value) }, events: { on: () => () => {} }, documentStorage: { readText: async () => ({ content: stored, version: String(revision) }), writeTextAtomic: async (_, content) => { stored = content; return { version: String(++revision) }; } }, workspaces: { list: async () => [{ path: "/repo", name: "仓库" }] }, models: { listEngines: async () => [{ id: "codex", available: true, enabled: true }], catalog: async () => ({ engines: [], errors: [] }) }, sessions: {} };
+  const dispose = activate(ctx); const container = document.createElement("div"); document.body.append(container); const root = createRoot(container);
+  try {
+    await act(async () => root.render(React.createElement(host.Component))); await settle();
+    const more = container.querySelector(".ptb-card-more"); more.open = true; await settle();
+    await click("编辑", container);
+    assert.equal(host.active(), "task-editor");
+    const form = container.querySelector(".ptb-form");
+    const areas = [...form.querySelectorAll("textarea")];
+    assert.equal(areas.length, 2);
+    assert.ok(areas.every((area) => !area.hasAttribute("required")), "需求与验收不再强制 required");
+    await act(async () => Simulate.change(form.querySelector("input"), { target: { value: "草稿卡v2" } })); await settle();
+    await act(async () => Simulate.submit(form)); await settle();
+    const saved = JSON.parse(stored).tasks[0];
+    assert.equal(saved.title, "草稿卡v2");
+    assert.equal(saved.description, "");
+    assert.ok(!saved.criteria, "仅改标题保存后仍是草稿");
   } finally { await act(async () => root.unmount()); dispose(); container.remove(); }
 });

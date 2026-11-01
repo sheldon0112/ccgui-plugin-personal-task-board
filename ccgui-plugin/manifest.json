@@ -1,7 +1,7 @@
 {
   "id": "personal-task-board",
   "name": "个人任务看板",
-  "version": "0.1.32",
+  "version": "0.1.33",
   "tier": "js",
   "sdkVersion": ">=0.3.23",
   "description": "本地管理任务，交给 CC GUI 原生会话执行并人工验收。",

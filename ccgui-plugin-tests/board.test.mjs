@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { dueDateShortcut, createBoard, createViewStore, selectTasks, routesToAgent, childFromComment, isOverdue, resumeTarget, taskMetrics, taskAttachments, revealTaskView, taskNotices, taskTimeline, taskSwimlanes, stageNotices, selectTaskRange, sourceContext, taskHistory, commentAgentId } from "../ccgui-plugin/main.js";
+import { dueDateShortcut, createBoard, createViewStore, selectTasks, routesToAgent, childFromComment, isOverdue, resumeTarget, taskMetrics, taskAttachments, revealTaskView, taskNotices, taskTimeline, taskSwimlanes, stageNotices, selectTaskRange, sourceContext, taskHistory, commentAgentId, formatEstimate } from "../ccgui-plugin/main.js";
 
 const input = { title: "修复列表", description: "空列表显示占位", criteria: "空列表不抛异常", priority: "high", workspacePath: "/repo", engine: "codex", model: "model-a" };
 const deferred = () => { let resolve; let reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; };
@@ -39,16 +39,20 @@ function setup(options = {}) {
   return { board, ctx, calls, options, file: () => file, conflict: () => revision++, emit: (patch) => listener?.({ engine: "codex", workspacePath: "/repo", runId: "r1", sessionId: "s1", ...patch }) };
 }
 
-test("创建、编辑、重载保留任务；空需求和非法优先级不能写入", async () => {
+test("创建、编辑、重载保留任务；空需求可存草稿，非法优先级不能写入", async () => {
   const env = setup(); await env.board.ready;
-  await assert.rejects(env.board.save({ ...input, criteria: " " }), /验收标准/);
+  const draftId = await env.board.save({ ...input, criteria: " " });
+  const draft = env.board.getSnapshot().tasks.find((task) => task.id === draftId);
+  assert.ok(draft, "空验收标准现在保存为草稿任务");
+  await assert.rejects(env.board.start(draftId), /补充验收标准/);
   await assert.rejects(env.board.save({ ...input, priority: "urgent" }), /优先级/);
-  assert.equal(env.calls.writes, 0);
+  assert.equal(env.calls.writes, 1);
   const id = await env.board.save(input);
   await env.board.save({ ...input, title: "修改标题" }, id);
   const other = setup({ file: env.file() }); await other.board.ready;
-  assert.equal(other.board.getSnapshot().tasks[0].title, "修改标题");
-  assert.equal(other.board.getSnapshot().tasks[0].priority, "high");
+  const reloaded = other.board.getSnapshot().tasks.find((task) => task.id === id);
+  assert.equal(reloaded.title, "修改标题");
+  assert.equal(reloaded.priority, "high");
   env.board.dispose(); other.board.dispose();
 });
 
@@ -231,11 +235,14 @@ test("附件可代替需求和验收文字，分区保存并传入原生会话",
   env.board.dispose();
 });
 
-test("附件记录损坏或缺失不能绕过必填校验", async () => {
+test("附件记录损坏不能保存；缺附件但无文字时存为草稿", async () => {
   const env = setup(); await env.board.ready;
-  await assert.rejects(env.board.save({ ...input, description: "", descriptionFiles: [] }), /输入文字或选择附件/);
+  const draftId = await env.board.save({ ...input, description: "", descriptionFiles: [] });
+  const draft = env.board.getSnapshot().tasks.find((task) => task.id === draftId);
+  assert.ok(draft, "无需求文字与附件时保存为草稿");
+  await assert.rejects(env.board.start(draftId), /补充需求/);
   await assert.rejects(env.board.save({ ...input, criteriaFiles: [{ name: "x", path: "/x" }] }), /附件记录无效/);
-  assert.equal(env.calls.writes, 0); env.board.dispose();
+  env.board.dispose();
 });
 
 test("验收反馈独立追加；修正携带反馈，原任务及旧会话保留", async () => {
@@ -1236,4 +1243,60 @@ test("批量排期拒绝运行中和待核对任务，不绕过运行恢复", as
   await assert.rejects(recovered.board.bulkUpdate([a, b], { dueDate: "2026-11-02" }), /未进行批量修改/);
   assert.ok(recovered.board.getSnapshot().tasks.every((task) => !task.dueDate));
   env.board.dispose(); recovered.board.dispose();
+});
+
+test("草稿任务补充后可执行；manual 排序按 order 排列", async () => {
+  const env = setup(); await env.board.ready;
+  const draftId = await env.board.save({ ...input, description: "", criteria: "", priority: "medium" });
+  await assert.rejects(env.board.start(draftId), /草稿任务请先补充/);
+  await env.board.save({ ...input, title: "补全后" }, draftId);
+  await env.board.start(draftId);
+  assert.equal(env.board.getSnapshot().tasks.find((task) => task.id === draftId).status, "running");
+  env.board.dispose();
+});
+
+test("reorderColumn 重排同列任务，非法输入与执行中列拒绝", async () => {
+  const env = setup(); await env.board.ready;
+  const a = await env.board.save(input);
+  const b = await env.board.save({ ...input, title: "第二项" });
+  const c = await env.board.save({ ...input, title: "第三项" });
+  await env.board.reorderColumn("todo", [b, c, a]);
+  const orders = Object.fromEntries(env.board.getSnapshot().tasks.map((task) => [task.id, task.order]));
+  assert.deepEqual([orders[a], orders[b], orders[c]], [2, 0, 1]);
+  await assert.rejects(env.board.reorderColumn("todo", [b, c]), /任务列表已变化/);
+  await env.board.start(c);
+  await assert.rejects(env.board.reorderColumn("running", [c]), /不能重排/);
+  await assert.rejects(env.board.reorderColumn("nope", []), /排序参数无效/);
+  env.board.dispose();
+});
+
+test("估时字段保存、行内修改与聚合输出", async () => {
+  const env = setup(); await env.board.ready;
+  const id = await env.board.save({ ...input, estimate: 3.5 });
+  assert.equal(env.board.getSnapshot().tasks[0].estimate, 3.5);
+  await assert.rejects(env.board.save({ ...input, title: "非法", estimate: -1 }), /估时应为/);
+  await env.board.editFields(id, { estimate: "2" });
+  assert.equal(env.board.getSnapshot().tasks[0].estimate, 2);
+  await env.board.editFields(id, { estimate: "" });
+  assert.equal(env.board.getSnapshot().tasks[0].estimate, null);
+  const list = selectTasks(env.board.getSnapshot().tasks, {});
+  assert.equal(formatEstimate(null), "—");
+  assert.equal(formatEstimate(2), "2h");
+  assert.equal(formatEstimate(2.5), "2.5h");
+  env.board.dispose();
+});
+
+test("通知分级：失败与待核对为需处理，待验收为关注，已完成为信息", () => {
+  const base = { id: "t", title: "任务", description: "需求", criteria: "验收", priority: "medium", workspacePath: "/repo", engine: "codex", createdAt: "2026-10-29", updatedAt: "2026-10-29", recovery: false, comments: [] };
+  const run = (id, outcome, startedAt, endedAt) => ({ id, runId: id, sessionId: id, engine: "codex", model: "", workspacePath: "/repo", startedAt, endedAt: endedAt || null, outcome });
+  const review = { ...base, status: "review", runs: [run("r1", "ended", "2026-10-29T01:00:00Z", "2026-10-29T02:00:00Z")] };
+  const failed = { ...base, id: "f", status: "blocked", runs: [run("r2", "error", "2026-10-29T01:00:00Z", "2026-10-29T02:00:00Z")] };
+  const unknown = { ...base, id: "u", status: "blocked", recovery: true, runs: [run("r3", "unknown", "2026-10-29T01:00:00Z", null)] };
+  const done = { ...base, id: "d", status: "done", runs: [run("r4", "ended", "2026-10-29T01:00:00Z", "2026-10-29T02:00:00Z")] };
+  const notices = taskNotices([review, failed, unknown, done]);
+  const severity = Object.fromEntries(notices.map((entry) => [entry.id, entry.severity]));
+  assert.equal(severity.r1, "attention");
+  assert.equal(severity.r2, "action");
+  assert.equal(severity.r3, "action");
+  assert.equal(severity.r4, "info");
 });
